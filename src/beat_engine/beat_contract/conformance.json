@@ -708,6 +708,188 @@
       ]
     },
     {
+      "name": "coupled_interface_transfer_impedance_layer",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system"
+          ],
+          "value": {
+            "id": "system:example",
+            "name": "Independent BEAT example",
+            "contract_version": 1,
+            "meshes": [
+              {
+                "id": "mesh:exterior",
+                "name": "Exterior",
+                "file": "exterior.msh",
+                "purpose": "bem_surface",
+                "scale_to_m": 0.001,
+                "translation_m": [
+                  0,
+                  0,
+                  0
+                ]
+              },
+              {
+                "id": "mesh:interior",
+                "name": "Interior",
+                "file": "interior.msh",
+                "purpose": "fem_volume",
+                "scale_to_m": 0.001,
+                "translation_m": [
+                  0,
+                  0,
+                  0
+                ]
+              }
+            ],
+            "regions": [
+              {
+                "id": "region:exterior",
+                "name": "Exterior",
+                "kind": "unbounded_air",
+                "mesh_ids": [
+                  "mesh:exterior"
+                ],
+                "volume_groups": [],
+                "sound_speed_m_per_s": 343.0,
+                "density_kg_per_m3": 1.21,
+                "loss_model": {}
+              },
+              {
+                "id": "region:interior",
+                "name": "Interior",
+                "kind": "bounded_air",
+                "mesh_ids": [
+                  "mesh:interior"
+                ],
+                "volume_groups": [
+                  {
+                    "mesh_id": "mesh:interior",
+                    "dimension": 3,
+                    "tag": 1,
+                    "name": null
+                  }
+                ],
+                "sound_speed_m_per_s": 343,
+                "density_kg_per_m3": 1.21,
+                "loss_model": {}
+              }
+            ],
+            "boundaries": [
+              {
+                "id": "boundary:source",
+                "name": "Source",
+                "kind": "moving",
+                "region_id": "region:exterior",
+                "group": {
+                  "mesh_id": "mesh:exterior",
+                  "dimension": 2,
+                  "tag": 2,
+                  "name": null
+                },
+                "parameters": {}
+              },
+              {
+                "id": "boundary:interior-interface",
+                "name": "interior",
+                "region_id": "region:interior",
+                "kind": "interface",
+                "group": {
+                  "mesh_id": "mesh:interior",
+                  "dimension": 2,
+                  "tag": 3,
+                  "name": null
+                },
+                "parameters": {}
+              },
+              {
+                "id": "boundary:exterior-interface",
+                "name": "exterior",
+                "region_id": "region:exterior",
+                "kind": "interface",
+                "group": {
+                  "mesh_id": "mesh:exterior",
+                  "dimension": 2,
+                  "tag": 3,
+                  "name": null
+                },
+                "parameters": {}
+              }
+            ],
+            "interfaces": [
+              {
+                "id": "interface:one",
+                "name": "One",
+                "bounded_boundary_id": "boundary:interior-interface",
+                "unbounded_boundary_id": "boundary:exterior-interface",
+                "topology": {
+                  "fem_vertex_indices": [
+                    0,
+                    1,
+                    2
+                  ],
+                  "fem_to_bem_vertex_indices": [
+                    0,
+                    1,
+                    2
+                  ],
+                  "fem_face_indices": [
+                    0
+                  ],
+                  "bem_face_indices": [
+                    0
+                  ],
+                  "normal_sign": [
+                    -1
+                  ],
+                  "max_coordinate_error": 0.0,
+                  "fem_facets_on_tetra_boundary": 1,
+                  "bem_boundary_edges": 0
+                }
+              }
+            ],
+            "components": [
+              {
+                "id": "component:source",
+                "name": "Source",
+                "kind": "ideal_velocity_source",
+                "boundary_ids": [
+                  "boundary:source"
+                ],
+                "parameters": {}
+              }
+            ],
+            "excitation_ports": [
+              {
+                "id": "excitation:source",
+                "name": "Source",
+                "component_id": "component:source",
+                "kind": "normal_velocity"
+              }
+            ]
+          }
+        },
+        {
+          "path": [
+            "compiled_system",
+            "boundaries",
+            1,
+            "parameters"
+          ],
+          "value": {
+            "transfer_impedance": {
+              "model": "resistance_mass",
+              "resistance_pa_s_per_m": 125.0,
+              "mass_kg_per_m2": 0.004
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "vertex_length_mismatch",
       "valid": false,
       "changes": [

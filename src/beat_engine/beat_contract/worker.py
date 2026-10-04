@@ -44,6 +44,10 @@ def validate_worker_ready(info: dict) -> None:
             and all(type(value) is int and value > 0 for value in versions),
             f"invalid {name} versions.",
         )
+    _require(
+        all(isinstance(value, str) and value for value in info.get("optional_physics", [])),
+        "invalid optional_physics capabilities.",
+    )
     for name in ("operations", "precisions", "solve_kinds"):
         values = info.get(name)
         _require(
@@ -85,6 +89,13 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
             _require(
                 "interface_radiated_pressure" in info.get("optional_output_quantities", []),
                 "interface radiation output is unavailable; update BEAT Engine.",
+            )
+        if any("transfer_impedance" in boundary["parameters"] for boundary in request["compiled_system"]["boundaries"]):
+            # An engine without the capability ignores the parameter and solves without the layer.
+            _require(
+                "interface_transfer_impedance" in info.get("optional_physics", []),
+                "interface transfer-impedance layers are unavailable (this engine would solve without them); "
+                "update BEAT Engine.",
             )
         options = request["solver_options"]
         kinds = {region["kind"] for region in request["compiled_system"]["regions"]}

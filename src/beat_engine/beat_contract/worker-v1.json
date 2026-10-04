@@ -6,7 +6,7 @@
   },
   "engine": {
     "name": "BEAT Engine",
-    "version": "0.3.0"
+    "version": "0.3.0+ti1"
   },
   "contracts": {
     "system_request": [
@@ -51,6 +51,9 @@
   "phasor_conventions": [
     "exp(-i omega t)",
     "exp(+i omega t)"
+  ],
+  "optional_physics": [
+    "interface_transfer_impedance"
   ],
   "optional_output_quantities": [
     "interface_average_normal_velocity",

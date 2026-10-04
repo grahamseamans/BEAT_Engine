@@ -67,6 +67,7 @@ end
     @test info["contracts"]["system_request"] == [1]
     @test info["contracts"]["compiled_system"] == [1]
     @test info["contracts"]["system_result"] == [2]
+    @test info["optional_physics"] == ["interface_transfer_impedance"]
     @test info["runtime"]["julia_version"] == string(VERSION)
     @test length(info["engine"]["source_sha256"]) == 64
     @test haskey(info["engine"]["source_files_sha256"], "julia_local/coupled_solver.jl")

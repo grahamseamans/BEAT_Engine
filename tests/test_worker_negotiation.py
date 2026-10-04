@@ -202,3 +202,33 @@ def test_interface_radiation_requires_advertised_output(ready, payload):
     ready["optional_output_quantities"].remove("interface_radiated_pressure")
     with pytest.raises(WorkerCompatibilityError, match="interface radiation"):
         negotiate_submission(ready, payload, "solve")
+
+
+def _conformance_request(name):
+    corpus = json.loads((CONTRACT / "conformance.json").read_text())
+    request = copy.deepcopy(corpus["base_request"])
+    for change in next(case for case in corpus["cases"] if case["name"] == name)["changes"]:
+        parent = request
+        for key in change["path"][:-1]:
+            parent = parent[key]
+        parent[change["path"][-1]] = change["value"]
+    return request
+
+
+def test_transfer_impedance_layer_requires_advertised_physics(ready):
+    layered = _conformance_request("coupled_interface_transfer_impedance_layer")
+    plain = _conformance_request("conforming_coupled_interface")
+    assert "interface_transfer_impedance" in ready["optional_physics"]
+    assert negotiate_submission(ready, layered, "solve")["result_schema_version"] == 2
+    # An engine that does not advertise the layer would solve without it: refuse before submitting.
+    for unpatched in (dict(ready, optional_physics=[]), {k: v for k, v in ready.items() if k != "optional_physics"}):
+        with pytest.raises(WorkerCompatibilityError, match="transfer-impedance layers are unavailable"):
+            negotiate_submission(unpatched, layered, "solve")
+        assert negotiate_submission(unpatched, plain, "solve")["result_schema_version"] == 2
+
+
+@pytest.mark.parametrize("value", [[""], [1], [None]])
+def test_rejects_invalid_optional_physics(ready, value):
+    ready["optional_physics"] = value
+    with pytest.raises(WorkerCompatibilityError, match="optional_physics"):
+        validate_worker_ready(ready)
