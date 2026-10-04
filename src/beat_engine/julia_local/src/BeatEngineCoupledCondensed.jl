@@ -490,6 +490,45 @@ function _interface_elimination_map(interface_map, interface_operators, gamma_fe
 end
 
 """
+    _add_pressure_elimination_transfer_impedance!(coupled, rows, gamma_block, flux_range, gamma_dof,
+        jump_coefficients)
+
+Under pressure elimination with transfer-impedance layers, `p_Γ = P p_B + D q`: rows that read
+`p_Γ` through `gamma_block` (the Schur rows, and the mechanical rows) gain
+`gamma_block[:, c] * d` in the column of interface dof `gamma_dof[c]`. Writes nothing without a layer.
+"""
+function _add_pressure_elimination_transfer_impedance!(
+    coupled, rows, gamma_block, flux_range, gamma_dof, jump_coefficients,
+)
+    isempty(jump_coefficients) && return coupled
+    gamma_column_of_interface_dof = invperm(gamma_dof)
+    for layer in jump_coefficients, interface_dof in layer.interface_dofs
+        gamma_column = gamma_column_of_interface_dof[interface_dof]
+        @views coupled[rows, flux_range[interface_dof]] .+= gamma_block[:, gamma_column] .* layer.jump_coefficient
+    end
+    return coupled
+end
+
+"""
+    _add_transfer_impedance_jump_to_retained_pressure!(retained_pressure, gamma_dof, jump_coefficients,
+        interface_flux)
+
+Recover `p_Γ = P p_B + D q` after pressure elimination: retained row `c` gains `d q` of interface dof
+`gamma_dof[c]`. A no-op without a layer.
+"""
+function _add_transfer_impedance_jump_to_retained_pressure!(
+    retained_pressure, gamma_dof, jump_coefficients, interface_flux,
+)
+    isempty(jump_coefficients) && return retained_pressure
+    gamma_column_of_interface_dof = invperm(gamma_dof)
+    for layer in jump_coefficients, interface_dof in layer.interface_dofs
+        @views retained_pressure[gamma_column_of_interface_dof[interface_dof], :] .+=
+            layer.jump_coefficient .* interface_flux[interface_dof, :]
+    end
+    return retained_pressure
+end
+
+"""
     _interface_mass_factorization(store, interface_operators, gamma_fem_vertices)
 
 Sparse real LU of `M_Γ = fem_load[Γ, :]`, held in `store` across frequencies of one cached sweep.
@@ -1471,6 +1510,7 @@ function prepare_condensed_coupled_cache(
     retained_fem_vertices=interface_map.fem_vertex_indices,
     bulk_loss_factor_by_vertex=zeros(T, length(fem_mesh.vertices)),
     wall_impedances=NamedTuple[],
+    interface_transfer_impedances=NamedTuple[],
     bem_backend::Symbol=:cpu,
 ) where {T<:AbstractFloat}
     # The condensed solver's linear algebra is CPU-only; the BEM operators may
@@ -1488,6 +1528,7 @@ function prepare_condensed_coupled_cache(
         retained_fem_vertices=retained_fem_vertices,
         bulk_loss_factor_by_vertex=bulk_loss_factor_by_vertex,
         wall_impedances=wall_impedances,
+        interface_transfer_impedances=interface_transfer_impedances,
     )
     # The base order is always carried, whether or not any frequency selects it: with the q1 tier
     # enabled and a base order of 4, every frequency can select 1 or 2 and leave the base out of
@@ -1634,6 +1675,7 @@ function build_condensed_coupled_system(
     bulk_loss_factor::T=zero(T),
     bulk_loss_factor_by_vertex=nothing,
     wall_impedances=NamedTuple[],
+    interface_transfer_impedances=NamedTuple[],
     transducers::AbstractVector{ElectrodynamicTransducer{T}}=ElectrodynamicTransducer{T}[],
     transducer_operators=nothing,
     prescribed_bem_normal_velocity=nothing,
@@ -1689,6 +1731,7 @@ function build_condensed_coupled_system(
             bulk_loss_factor_by_vertex
         ),
         wall_impedances=wall_impedances,
+        interface_transfer_impedances=interface_transfer_impedances,
     ) : cache
     if !isnothing(cache)
         # Orders are compared as integers. `TriangleRule` defines no `==`, so comparing rules here
@@ -1709,6 +1752,7 @@ function build_condensed_coupled_system(
     prepared = merge(condensed_cache.base, bundle)
     prepared.bem_backend in (:cpu, :metal) ||
         error("Condensed coupled cache must be built for the CPU or Metal BEM backend.")
+    require_cached_interface_transfer_impedances(prepared, interface_map, interface_transfer_impedances, T)
     prepared.symmetry_mode == BeatEngineCore.normalized_symmetry_mode(symmetry_mode) ||
         error("Coupled cache symmetry mode does not match requested symmetry.")
     prepared.retained_fem_vertices == retained_fem_vertices ||
@@ -1789,6 +1833,25 @@ function build_condensed_coupled_system(
         schur_float64=dense_type === Float64,
     )
     interface_elimination, elimination_required = _interface_elimination_request(bem_backend)
+    transfer_impedance_jump_coefficients = interface_transfer_impedance_jump_coefficients(
+        prepared.interface_transfer_impedances,
+        omega,
+        density,
+    )
+    if interface_elimination == :flux && !isempty(transfer_impedance_jump_coefficients)
+        # Flux elimination factors the frequency-independent interface mass M_Γ once; a layer
+        # turns it into the dense, per-frequency M_Γ - S D, which that path does not form.
+        layer_interfaces = join((repr(layer.interface_id) for layer in transfer_impedance_jump_coefficients), ", ")
+        elimination_required && error(
+            "BLAB_COUPLED_INTERFACE_FLUX_ELIMINATION=on cannot hold interface transfer_impedance " *
+            "(interfaces $layer_interfaces): flux elimination needs the plain continuity rows. " *
+            "Set it to auto or off.",
+        )
+        push!(optimization_fallbacks,
+            "interface flux elimination not used: interface transfer_impedance on $layer_interfaces; " *
+            "using interface pressure elimination")
+        interface_elimination = :pressure
+    end
     elimination_map = nothing
     if interface_elimination != :none
         try
@@ -1987,6 +2050,7 @@ function build_condensed_coupled_system(
         coupled[bem_range, bem_range] = bem_lhs
         coupled[bem_range, flux_range] = bem_interface_block
         coupled[flux_range, bem_range] = -Complex{T}.(Matrix(interface_operators.bem_trace))
+        add_interface_transfer_impedance_block!(coupled, flux_range, transfer_impedance_jump_coefficients)
     end
     if transducer_count > 0 && transducer_condensation
         if interface_elimination == :none
@@ -2060,6 +2124,11 @@ function build_condensed_coupled_system(
             for (column, target) in enumerate(elimination_map.bem_of_gamma)
                 @views coupled[gamma_row_range, bem_columns[column]] .+= condensation.schur[:, column]
             end
+            # With a transfer-impedance layer p_Γ = P p_B + D q, so the Γ rows read S D q too.
+            _add_pressure_elimination_transfer_impedance!(
+                coupled, gamma_row_range, condensation.schur, flux_range, elimination_map.gamma_dof,
+                transfer_impedance_jump_coefficients,
+            )
             coupled[bem_range, flux_range] = bem_interface_block
             transducer_count > 0 && (coupled[gamma_row_range, mechanical_range] = gamma_mech)
             elimination = (
@@ -2133,6 +2202,11 @@ function build_condensed_coupled_system(
                     @views coupled[mechanical_range, bem_columns[column]] .+= mech_gamma[:, column]
                 end
             end
+            # The mechanical rows read p_Γ as well (flux elimination never runs with a layer).
+            interface_elimination == :pressure && _add_pressure_elimination_transfer_impedance!(
+                coupled, mechanical_range, mech_gamma, flux_range, elimination_map.gamma_dof,
+                transfer_impedance_jump_coefficients,
+            )
         end
         interface_elimination_s = (time_ns() - elimination_started) / 1.0e9
     end
@@ -2154,6 +2228,7 @@ function build_condensed_coupled_system(
         bulk_loss_factor=maximum(prepared.bulk_loss_factor_by_vertex; init=zero(T)),
         bulk_loss_factor_by_vertex=prepared.bulk_loss_factor_by_vertex,
         wall_admittances=wall_admittances,
+        interface_transfer_impedance=transfer_impedance_jump_coefficients,
         omega=omega,
         wavenumber=wavenumber,
         field_cache=prepared.field_cache,
@@ -2247,9 +2322,12 @@ function _solution_from_parts(
         prescribed_bem_neumann
     )
 
-    pressure_jump = (
+    # Residual of the interface condition: plain continuity, or the transfer-impedance jump.
+    pressure_jump = subtract_interface_transfer_impedance_jump!(
         system.interface_operators.fem_trace * fem_pressure -
-        system.interface_operators.bem_trace * bem_pressure
+        system.interface_operators.bem_trace * bem_pressure,
+        system_interface_transfer_impedance(system),
+        interface_flux,
     )
     pressure_scale = max(
         norm(system.interface_operators.fem_trace * fem_pressure),
@@ -2396,7 +2474,14 @@ function solve_condensed_coupled_excitations(system, excitations; reconstruct_in
     retained_pressure, interface_flux = if elimination_mode == :none
         solution[system.gamma_range, :], solution[system.flux_range, :]
     elseif elimination_mode == :pressure
-        solution[system.bem_range, :][elimination.bem_of_gamma, :], solution[system.flux_range, :]
+        # p_Γ = P p_B + D q; D is empty without a transfer-impedance layer.
+        pressure_eliminated_flux = solution[system.flux_range, :]
+        _add_transfer_impedance_jump_to_retained_pressure!(
+            solution[system.bem_range, :][elimination.bem_of_gamma, :],
+            elimination.gamma_dof,
+            system_interface_transfer_impedance(system),
+            pressure_eliminated_flux,
+        ), pressure_eliminated_flux
     else
         bem_gamma = ComplexF64.(dense_solution[system.bem_range, :][elimination.bem_of_gamma, :])
         flux = if hasproperty(elimination, :mass_operator)

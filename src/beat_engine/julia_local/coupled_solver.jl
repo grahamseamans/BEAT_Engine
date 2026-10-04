@@ -103,6 +103,12 @@ function speaker_interior_state_matrix(system)
     system.formulation == :fem_interface_condensed || error(
         "Speaker ROM construction requires the FEM-interface-condensed formulation.",
     )
+    # The ROM state matrix carries plain continuity rows; it does not hold the layer's jump.
+    isempty(system_interface_transfer_impedance(system)) || error(
+        "Speaker ROM construction cannot hold interface transfer_impedance (interfaces " *
+        join((repr(layer.interface_id) for layer in system_interface_transfer_impedance(system)), ", ") *
+        "); remove the speaker ROM request or the layers.",
+    )
     condensation = system.condensation
     hasproperty(condensation, :transducer_condensed) && condensation.transducer_condensed && error(
         "Speaker ROM construction needs transducer surfaces in the retained Schur block; " *
@@ -591,6 +597,10 @@ function aggregate_bem_region(meshes, region, boundaries, ::Type{T}) where {T<:A
         solver_tag > 0 || error(
             "Exterior boundary $(repr(boundary_id)) tag $source_tag is not " *
             "present in BEM mesh $(repr(mesh_id)).",
+        )
+        haskey(get(boundary, "parameters", Dict{String,Any}()), "transfer_impedance") && error(
+            "Exterior boundary $(repr(boundary_id)) carries transfer_impedance; the layer belongs on " *
+            "the interface's bounded (FEM-side) boundary.",
         )
         boundary_tag_by_id[boundary_id] = solver_tag
     end
@@ -1325,12 +1335,40 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     return (cancelled=cancel_requested(), solved_count=solved_count)
 end
 
+"""
+    interface_transfer_impedance_diagnostics(transfer_impedances, omega)
+
+Provenance for every layer the request carried (including exact zeros, which leave the
+interface unmodified): R, M and the complex `Z_s` at this frequency in the active convention.
+"""
+function interface_transfer_impedance_diagnostics(transfer_impedances, omega)
+    return Dict(
+        "phasor_convention" => phasor_convention(),
+        "normal_orientation" => "bounded_region_outward",
+        "layers" => [
+            begin
+                impedance = interface_transfer_impedance(layer, omega)
+                Dict(
+                    "interface_id" => layer.interface_id,
+                    "boundary_id" => layer.boundary_id,
+                    "resistance_pa_s_per_m" => Float64(layer.resistance_pa_s_per_m),
+                    "mass_kg_per_m2" => Float64(layer.mass_kg_per_m2),
+                    "impedance_real_pa_s_per_m" => Float64(real(impedance)),
+                    "impedance_imag_pa_s_per_m" => Float64(imag(impedance)),
+                )
+            end
+            for layer in transfer_impedances
+        ],
+    )
+end
+
 function per_interface_errors(
     solution,
     fem_mesh,
     bem_mesh,
     interface_maps,
     interface_ranges,
+    transfer_impedance_jump_coefficients,
     ::Type{T},
 ) where {T<:AbstractFloat}
     pressure_errors = T[]
@@ -1339,7 +1377,14 @@ function per_interface_errors(
         fem_trace = solution.fem_pressure[interface_map.fem_vertex_indices]
         bem_trace = solution.bem_pressure[interface_map.fem_to_bem_vertex_indices]
         pressure_scale = max(norm(fem_trace), norm(bem_trace), eps(T))
-        push!(pressure_errors, T(norm(fem_trace - bem_trace) / pressure_scale))
+        # Residual of the interface condition: plain continuity, or the transfer-impedance jump.
+        interface_condition_residual = subtract_interface_transfer_impedance_jump!(
+            fem_trace - bem_trace,
+            transfer_impedance_jump_coefficients,
+            solution.interface_flux;
+            interface_range=interface_range,
+        )
+        push!(pressure_errors, T(norm(interface_condition_residual) / pressure_scale))
 
         local_flux = solution.interface_flux[interface_range]
         interface_dof = Dict(
@@ -1397,6 +1442,7 @@ function aggregate_fem_domains(
     domains = NamedTuple[]
     bulk_loss_factor_by_vertex = T[]
     wall_impedances = NamedTuple[]
+    transfer_impedance_by_boundary_id = Dict{String,Any}()
     plane_wave_terminations = NamedTuple[]
     fem_boundary_tag_by_id = Dict{String,Int}()
     domain_by_boundary_id = Dict{String,Int}()
@@ -1482,6 +1528,17 @@ function aggregate_fem_domains(
                     ),
                 )
             end
+            if haskey(parameters, "transfer_impedance")
+                boundary_kind == "interface" || error(
+                    "transfer_impedance on boundary $(repr(boundary_id)) requires kind \"interface\"; " *
+                    "got $(repr(boundary_kind)).",
+                )
+                transfer_impedance_by_boundary_id[boundary_id] = interface_transfer_impedance_from_wire(
+                    parameters["transfer_impedance"],
+                    boundary_id,
+                    T,
+                )
+            end
         end
         remapped_boundary_tags = [
             get(local_tag_map, tag, 0)
@@ -1555,8 +1612,44 @@ function aggregate_fem_domains(
         domain_by_boundary_id=domain_by_boundary_id,
         bulk_loss_factor_by_vertex=bulk_loss_factor_by_vertex,
         wall_impedances=wall_impedances,
+        transfer_impedance_by_boundary_id=transfer_impedance_by_boundary_id,
         plane_wave_terminations=plane_wave_terminations,
     )
+end
+
+"""
+    interface_transfer_impedance_from_wire(raw_layer, boundary_id, T)
+
+Parse `boundary.parameters["transfer_impedance"]` on an interface's bounded boundary:
+`{"model": "resistance_mass", "resistance_pa_s_per_m": R, "mass_kg_per_m2": M}`, R and M real,
+SI, referred to the interface face area. Every key is required; unknown keys are refused.
+"""
+function interface_transfer_impedance_from_wire(raw_layer, boundary_id, ::Type{T}) where {T<:AbstractFloat}
+    layer_label = "transfer_impedance on boundary $(repr(boundary_id))"
+    raw_layer isa AbstractDict || error("$layer_label must be an object.")
+    required_keys = ("model", "resistance_pa_s_per_m", "mass_kg_per_m2")
+    unsupported = [String(name) for name in keys(raw_layer) if !(String(name) in required_keys)]
+    isempty(unsupported) || error(
+        "$layer_label has unsupported keys: " * join(sort(unsupported), ", "),
+    )
+    missing_keys = [name for name in required_keys if !haskey(raw_layer, name)]
+    isempty(missing_keys) || error("$layer_label is missing: " * join(missing_keys, ", "))
+    model = raw_layer["model"]
+    model == "resistance_mass" || error(
+        "$layer_label has unsupported model $(repr(model)); expected \"resistance_mass\".",
+    )
+    values = map(("resistance_pa_s_per_m", "mass_kg_per_m2")) do name
+        raw_value = raw_layer[name]
+        raw_value isa Real && !(raw_value isa Bool) || error(
+            "$layer_label $name must be a real number; got $(repr(raw_value)).",
+        )
+        value = T(raw_value)
+        isfinite(value) && value >= zero(T) || error(
+            "$layer_label $name must be finite and non-negative (a passive layer); got $raw_value.",
+        )
+        value
+    end
+    return (resistance_pa_s_per_m=values[1], mass_kg_per_m2=values[2])
 end
 
 function combined_interface_map_from_wire(
@@ -1567,6 +1660,7 @@ function combined_interface_map_from_wire(
 )
     maps = ConformingInterfaceMap[]
     ranges = UnitRange{Int}[]
+    transfer_impedances = NamedTuple[]
     next_interface_dof = 1
     for interface in interfaces
         interface_id = String(interface["id"])
@@ -1618,13 +1712,33 @@ function combined_interface_map_from_wire(
         push!(maps, mapped)
         count = length(mapped.fem_vertex_indices)
         push!(ranges, next_interface_dof:(next_interface_dof + count - 1))
+        layer = get(fem_domains.transfer_impedance_by_boundary_id, bounded_boundary_id, nothing)
+        isnothing(layer) || push!(
+            transfer_impedances,
+            (
+                interface_id=interface_id,
+                boundary_id=bounded_boundary_id,
+                interface_dofs=last(ranges),
+                resistance_pa_s_per_m=layer.resistance_pa_s_per_m,
+                mass_kg_per_m2=layer.mass_kg_per_m2,
+            ),
+        )
         next_interface_dof += count
     end
+    orphan_layer_boundary_ids = setdiff(
+        keys(fem_domains.transfer_impedance_by_boundary_id),
+        (layer.boundary_id for layer in transfer_impedances),
+    )
+    isempty(orphan_layer_boundary_ids) || error(
+        "transfer_impedance on boundary " * join(sort(repr.(collect(orphan_layer_boundary_ids))), ", ") *
+        ": the boundary is not the bounded boundary of any interface.",
+    )
     if isempty(maps)
         return (
             map=ConformingInterfaceMap(Int[], Int[], Int[], Int[], Int[]),
             ranges=ranges,
             maps=maps,
+            transfer_impedances=transfer_impedances,
         )
     end
     return (
@@ -1637,6 +1751,7 @@ function combined_interface_map_from_wire(
         ),
         ranges=ranges,
         maps=maps,
+        transfer_impedances=transfer_impedances,
     )
 end
 
@@ -2025,6 +2140,11 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
 
     mesh_setup_started = time_ns()
     fem_domains = aggregate_fem_domains(meshes, bounded_regions, boundaries, FloatType)
+    isempty(fem_domains.transfer_impedance_by_boundary_id) || error(
+        "transfer_impedance on boundary " *
+        join(sort(repr.(collect(keys(fem_domains.transfer_impedance_by_boundary_id)))), ", ") *
+        " needs a coupled FEM-BEM interface; the interior FEM solve has none.",
+    )
     fem_mesh = fem_domains.mesh
     symmetry_tolerance = symmetry_plane_tolerance(fem_mesh.vertices)
     fem_mesh = VolumeMesh(
@@ -2765,6 +2885,7 @@ function solve_request_impl(request; event_mode=false)
                 retained_fem_vertices=retained_fem_vertices,
                 bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                 wall_impedances=fem_domains.wall_impedances,
+                interface_transfer_impedances=combined_interfaces.transfer_impedances,
                 bem_backend=bem_backend,
             )
         else
@@ -2780,6 +2901,7 @@ function solve_request_impl(request; event_mode=false)
                 retained_fem_vertices=retained_fem_vertices,
                 bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                 wall_impedances=fem_domains.wall_impedances,
+                interface_transfer_impedances=combined_interfaces.transfer_impedances,
             )
         end
         cache_setup_s = (time_ns() - cache_setup_started) / 1.0e9
@@ -2820,6 +2942,7 @@ function solve_request_impl(request; event_mode=false)
                     symmetry_mode=symmetry_mode,
                     bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                     wall_impedances=fem_domains.wall_impedances,
+                    interface_transfer_impedances=combined_interfaces.transfer_impedances,
                     transducers=transducers,
                     transducer_operators=transducer_operators,
                     prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
@@ -2848,6 +2971,7 @@ function solve_request_impl(request; event_mode=false)
                     coupled_bem_max_registers=coupled_bem_max_registers,
                     bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
                     wall_impedances=fem_domains.wall_impedances,
+                    interface_transfer_impedances=combined_interfaces.transfer_impedances,
                     transducers=transducers,
                     transducer_operators=transducer_operators,
                     prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
@@ -2879,6 +3003,7 @@ function solve_request_impl(request; event_mode=false)
                     bem_mesh,
                     combined_interfaces.maps,
                     combined_interfaces.ranges,
+                    system_interface_transfer_impedance(coupled_system),
                     FloatType,
                 )
                 for solution in solutions
@@ -3450,6 +3575,11 @@ function solve_request_impl(request; event_mode=false)
                                                          reconstruct_interior ? "evaluated" : "skipped"
             isnothing(rank_experiment) ||
                 (diagnostics["speaker_rom_rank_experiment"] = rank_experiment)
+            isempty(combined_interfaces.transfer_impedances) ||
+                (diagnostics["interface_transfer_impedance"] = interface_transfer_impedance_diagnostics(
+                    combined_interfaces.transfer_impedances,
+                    coupled_system.omega,
+                ))
             result = Dict(
                 "schema_version" => 2,
                 "freq_hz" => frequency_hz,

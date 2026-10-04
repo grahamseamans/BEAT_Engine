@@ -36,6 +36,14 @@ export VolumeMesh,
     assemble_fem_dynamic_stiffness,
     assemble_boundary_mass_matrix,
     miki_rigid_backed_surface_admittance,
+    active_interface_transfer_impedances,
+    require_cached_interface_transfer_impedances,
+    interface_transfer_impedance,
+    interface_transfer_impedance_jump_coefficients,
+    system_interface_transfer_impedance,
+    add_interface_transfer_impedance_block!,
+    interface_transfer_impedance_jump_vector,
+    subtract_interface_transfer_impedance_jump!,
     assemble_prescribed_velocity_load,
     sealed_cavity_modes,
     solve_prescribed_velocity_interior,
@@ -616,6 +624,195 @@ function miki_rigid_backed_surface_admittance(
     return admittance
 end
 
+# Transfer-impedance layers on FEM-BEM interfaces.
+#
+# A thin locally reacting layer (resistive screen, felt) across an interface turns the
+# collocated continuity row `p_F - p_B = 0` into the jump condition `p_F - p_B = Z_s v_n`,
+# with `v_n` the normal velocity along the bounded region's outward normal, continuous
+# through the layer, and `Z_s = R + time_derivative(omega) * M` (`R + i omega M` for
+# exp(+i omega t)). With `q = neumann_scale(density, omega) * v_n` the interface unknown,
+# each interface row becomes `p_F - p_B - d q = 0` with `d = Z_s / neumann_scale`: one
+# diagonal entry `-d` per interface degree of freedom on the (otherwise zero) flux-flux
+# block. FEM and BEM rows are unchanged. A layer is described by a named tuple
+# `(interface_id, boundary_id, interface_dofs, resistance_pa_s_per_m, mass_kg_per_m2)`,
+# where `interface_dofs` are its interface's columns in the combined interface map and
+# R, M are referred to the interface face area.
+
+"""
+    active_interface_transfer_impedances(transfer_impedances, interface_count, T)
+
+Validate every transfer-impedance layer and return those with `Z_s != 0`, converted to `T`.
+A layer with `R == M == 0` exactly is the unmodified interface: it is dropped here, so no
+code path writes anything for it and its results are those of the plain interface.
+"""
+function active_interface_transfer_impedances(
+    transfer_impedances,
+    interface_count::Integer,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    active_layers = NamedTuple[]
+    interface_dof_claimed = falses(interface_count)
+    for layer in transfer_impedances
+        layer_label = "Interface transfer_impedance on boundary $(repr(layer.boundary_id)) " *
+                      "(interface $(repr(layer.interface_id)))"
+        resistance_pa_s_per_m = T(layer.resistance_pa_s_per_m)
+        mass_kg_per_m2 = T(layer.mass_kg_per_m2)
+        isfinite(resistance_pa_s_per_m) && resistance_pa_s_per_m >= zero(T) || error(
+            "$layer_label: resistance_pa_s_per_m must be finite and non-negative " *
+            "(a passive layer); got $(layer.resistance_pa_s_per_m).",
+        )
+        isfinite(mass_kg_per_m2) && mass_kg_per_m2 >= zero(T) || error(
+            "$layer_label: mass_kg_per_m2 must be finite and non-negative " *
+            "(a passive layer); got $(layer.mass_kg_per_m2).",
+        )
+        interface_dofs = layer.interface_dofs
+        interface_dofs isa UnitRange{Int} && !isempty(interface_dofs) &&
+            first(interface_dofs) >= 1 && last(interface_dofs) <= interface_count || error(
+            "$layer_label: interface degrees of freedom $(interface_dofs) are not a non-empty " *
+            "range inside the $interface_count interface unknowns.",
+        )
+        any(interface_dof_claimed[interface_dofs]) && error(
+            "$layer_label: interface degrees of freedom $(interface_dofs) overlap another " *
+            "transfer-impedance layer.",
+        )
+        interface_dof_claimed[interface_dofs] .= true
+        iszero(resistance_pa_s_per_m) && iszero(mass_kg_per_m2) && continue
+        push!(
+            active_layers,
+            (
+                interface_id=String(layer.interface_id),
+                boundary_id=String(layer.boundary_id),
+                interface_dofs=interface_dofs,
+                resistance_pa_s_per_m=resistance_pa_s_per_m,
+                mass_kg_per_m2=mass_kg_per_m2,
+            ),
+        )
+    end
+    return active_layers
+end
+
+"""
+    require_cached_interface_transfer_impedances(prepared, interface_map, requested, T)
+
+A supplied coupled cache carries the layers it was prepared with; refuse a build that asks
+for different ones rather than solving with the cached set.
+"""
+function require_cached_interface_transfer_impedances(
+    prepared,
+    interface_map,
+    requested_transfer_impedances,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    requested_active_layers = active_interface_transfer_impedances(
+        requested_transfer_impedances,
+        length(interface_map.fem_vertex_indices),
+        T,
+    )
+    prepared.interface_transfer_impedances == requested_active_layers || error(
+        "Coupled cache interface_transfer_impedances do not match the requested " *
+        "interface_transfer_impedances; prepare the cache with the same layers.",
+    )
+    return nothing
+end
+
+"""
+    interface_transfer_impedance(layer, omega)
+
+`Z_s = R + time_derivative(omega) * M` in the active phasor convention (Pa s/m).
+"""
+interface_transfer_impedance(layer, omega::T) where {T<:AbstractFloat} =
+    Complex{T}(layer.resistance_pa_s_per_m) + time_derivative(omega) * layer.mass_kg_per_m2
+
+"""
+    interface_transfer_impedance_jump_coefficients(active_layers, omega, density)
+
+The one place the transfer-impedance block is built. For each active layer: its interface
+degrees of freedom, `Z_s` and the jump coefficient `d = Z_s / neumann_scale(density, omega)`,
+so the interface rows read `p_F - p_B - d q = 0` and the flux-flux block gains `-d` on its
+diagonal. Every solve path consumes this list; none recomputes `d`.
+"""
+function interface_transfer_impedance_jump_coefficients(
+    active_layers,
+    omega::T,
+    density::T,
+) where {T<:AbstractFloat}
+    normal_derivative_scale = neumann_scale(density, omega)
+    return [
+        begin
+            impedance = interface_transfer_impedance(layer, omega)
+            (
+                interface_id=layer.interface_id,
+                interface_dofs=layer.interface_dofs,
+                impedance=impedance,
+                jump_coefficient=Complex{T}(impedance / normal_derivative_scale),
+            )
+        end
+        for layer in active_layers
+    ]
+end
+
+"""
+    system_interface_transfer_impedance(system)
+
+The jump coefficients a built coupled system carries. Systems assembled by hand, without the
+field, have no layer; every reader goes through here.
+"""
+system_interface_transfer_impedance(system) =
+    hasproperty(system, :interface_transfer_impedance) ? system.interface_transfer_impedance : ()
+
+"""
+    add_interface_transfer_impedance_block!(matrix, flux_range, jump_coefficients)
+
+Add `-d` to the dense flux-flux diagonal; `flux_range` maps interface dofs to matrix rows
+and columns. Writes nothing when no layer is active.
+"""
+function add_interface_transfer_impedance_block!(matrix, flux_range, jump_coefficients)
+    for layer in jump_coefficients, interface_dof in layer.interface_dofs
+        flux_index = flux_range[interface_dof]
+        matrix[flux_index, flux_index] -= layer.jump_coefficient
+    end
+    return matrix
+end
+
+"""
+    interface_transfer_impedance_jump_vector(jump_coefficients, interface_count, T)
+
+`d` per interface degree of freedom (zero where no layer is active).
+"""
+function interface_transfer_impedance_jump_vector(
+    jump_coefficients,
+    interface_count::Integer,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    jump_vector = zeros(Complex{T}, interface_count)
+    for layer in jump_coefficients
+        jump_vector[layer.interface_dofs] .= layer.jump_coefficient
+    end
+    return jump_vector
+end
+
+"""
+    subtract_interface_transfer_impedance_jump!(pressure_jump, jump_coefficients, interface_flux;
+        interface_range=1:length(pressure_jump))
+
+Turn the nodal pressure difference `p_F - p_B` into the residual of the interface condition,
+`p_F - p_B - d q`. `pressure_jump[i]` belongs to interface dof `interface_range[i]`;
+`interface_flux` is indexed by interface dof. A no-op when no layer is active.
+"""
+function subtract_interface_transfer_impedance_jump!(
+    pressure_jump,
+    jump_coefficients,
+    interface_flux;
+    interface_range=1:length(pressure_jump),
+)
+    for layer in jump_coefficients, interface_dof in layer.interface_dofs
+        interface_dof in interface_range || continue
+        pressure_jump[interface_dof - first(interface_range) + 1] -=
+            layer.jump_coefficient * interface_flux[interface_dof]
+    end
+    return pressure_jump
+end
+
 function _p2_triangle_basis(lambda::AbstractVector{T}) where {T<:AbstractFloat}
     return T[
         lambda[1] * (T(2) * lambda[1] - one(T)),
@@ -1059,6 +1256,7 @@ function prepare_coupled_cache(
     coupled_bem_assembly::Symbol=:auto,
     bulk_loss_factor_by_vertex=zeros(T, length(fem_mesh.vertices)),
     wall_impedances=NamedTuple[],
+    interface_transfer_impedances=NamedTuple[],
 ) where {T<:AbstractFloat}
     is_quadratic(fem_mesh) && error(
         "Quadratic tetrahedra are currently supported only by the pure interior FEM solve.",
@@ -1098,6 +1296,12 @@ function prepare_coupled_cache(
 
     interface_started = time_ns()
     interface_operators = assemble_interface_operators(fem_mesh, bem_mesh, interface_map)
+    interface_count = length(interface_map.fem_vertex_indices)
+    active_transfer_impedances = active_interface_transfer_impedances(
+        interface_transfer_impedances,
+        interface_count,
+        T,
+    )
     interface_operator_cache_s = (time_ns() - interface_started) / 1.0e9
 
     bem_space_started = time_ns()
@@ -1250,6 +1454,19 @@ function prepare_coupled_cache(
             fem_load=build_sparse_cache(interface_operators.fem_load),
             fem_trace=build_sparse_cache(interface_operators.fem_trace),
             bem_trace=build_sparse_cache(interface_operators.bem_trace),
+            # Unit diagonal on each active layer's interface dofs; scattered with alpha = -d.
+            interface_transfer_impedance=[
+                build_sparse_cache(
+                    sparse(
+                        layer.interface_dofs,
+                        layer.interface_dofs,
+                        ones(T, length(layer.interface_dofs)),
+                        interface_count,
+                        interface_count,
+                    ),
+                )
+                for layer in active_transfer_impedances
+            ],
             condensed_fem_load=build_sparse_cache(
                 interface_operators.fem_load[gamma, :],
             ),
@@ -1290,6 +1507,7 @@ function prepare_coupled_cache(
         bulk_loss_mass=bulk_loss_mass,
         bulk_loss_factor_by_vertex=T.(collect(bulk_loss_factor_by_vertex)),
         wall_impedance_operators=wall_impedance_operators,
+        interface_transfer_impedances=active_transfer_impedances,
         interface_operators=interface_operators,
         p1=p1,
         dp0=dp0,
@@ -1346,9 +1564,9 @@ function release_coupled_cache!(cache)
         release_rocm_burton_miller_identity_cache!(cache.device_identity_cache)
         BeatEngineCore.amdgpu_module().unsafe_free!(cache.device_bem_flux)
         for (name, sparse_cache) in pairs(cache.device_sparse_blocks)
-            if name == :wall_impedance
-                for wall_cache in sparse_cache
-                    release_rocm_sparse_scatter_cache!(wall_cache)
+            if name in (:wall_impedance, :interface_transfer_impedance)
+                for block_cache in sparse_cache
+                    release_rocm_sparse_scatter_cache!(block_cache)
                 end
             elseif !isnothing(sparse_cache)
                 release_rocm_sparse_scatter_cache!(sparse_cache)
@@ -1423,9 +1641,9 @@ function release_coupled_cache!(cache)
     cache.device_bem_flux === nothing || BeatEngineCore.cuda_module().unsafe_free!(cache.device_bem_flux)
     BeatEngineCore.release_cuda_bem_flux_cache!(cache.device_bem_flux_sparse)
     for (name, sparse_cache) in pairs(cache.device_sparse_blocks)
-        if name == :wall_impedance
-            for wall_cache in sparse_cache
-                release_cuda_sparse_scatter_cache!(wall_cache)
+        if name in (:wall_impedance, :interface_transfer_impedance)
+            for block_cache in sparse_cache
+                release_cuda_sparse_scatter_cache!(block_cache)
             end
         else
             release_cuda_sparse_scatter_cache!(sparse_cache)
@@ -2038,6 +2256,7 @@ function build_coupled_system(
     bulk_loss_factor::T=zero(T),
     bulk_loss_factor_by_vertex=nothing,
     wall_impedances=NamedTuple[],
+    interface_transfer_impedances=NamedTuple[],
     transducers::AbstractVector{ElectrodynamicTransducer{T}}=ElectrodynamicTransducer{T}[],
     transducer_operators=nothing,
     prescribed_bem_normal_velocity=nothing,
@@ -2085,9 +2304,11 @@ function build_coupled_system(
             bulk_loss_factor_by_vertex
         ),
         wall_impedances=wall_impedances,
+        interface_transfer_impedances=interface_transfer_impedances,
     ) : cache
     prepared.bem_backend == bem_backend ||
         error("Coupled cache backend does not match requested BEM backend.")
+    require_cached_interface_transfer_impedances(prepared, interface_map, interface_transfer_impedances, T)
     prepared.symmetry_mode == BeatEngineCore.normalized_symmetry_mode(symmetry_mode) ||
         error("Coupled cache symmetry mode does not match requested symmetry.")
     prepared.retained_fem_vertices == retained_fem_vertices ||
@@ -2113,6 +2334,11 @@ function build_coupled_system(
     for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
         fem_system -= neumann_scale(density, omega) * admittance .* operator.matrix
     end
+    transfer_impedance_jump_coefficients = interface_transfer_impedance_jump_coefficients(
+        prepared.interface_transfer_impedances,
+        omega,
+        density,
+    )
     interface_operators = prepared.interface_operators
     transducer_count = length(transducers)
     size(resolved_transducer_operators.fem_surface, 2) == transducer_count ||
@@ -2383,6 +2609,19 @@ function build_coupled_system(
                 column_offset=first(bem_range) - 1,
                 alpha=-one(Complex{T}),
             )
+            for (layer_cache, layer) in zip(
+                prepared.device_sparse_blocks.interface_transfer_impedance,
+                transfer_impedance_jump_coefficients,
+            )
+                scatter_sparse!(
+                    d_coupled,
+                    layer_cache;
+                    row_offset=first(flux_range) - 1,
+                    column_offset=first(flux_range) - 1,
+                    alpha=-layer.jump_coefficient,
+                    add=true,
+                )
+            end
             if transducer_count > 0
                 d_fem_motion = device_array(
                     -normal_derivative_scale .* Complex{T}.(
@@ -2458,6 +2697,7 @@ function build_coupled_system(
             Complex{T}.(Matrix(interface_operators.fem_trace))
         host_coupled[flux_range, bem_range] =
             -Complex{T}.(Matrix(interface_operators.bem_trace))
+        add_interface_transfer_impedance_block!(host_coupled, flux_range, transfer_impedance_jump_coefficients)
         if transducer_count > 0
             host_coupled[fem_range, mechanical_range] =
                 -normal_derivative_scale .* Complex{T}.(
@@ -2510,6 +2750,7 @@ function build_coupled_system(
         bulk_loss_factor=maximum(prepared.bulk_loss_factor_by_vertex; init=zero(T)),
         bulk_loss_factor_by_vertex=prepared.bulk_loss_factor_by_vertex,
         wall_admittances=wall_admittances,
+        interface_transfer_impedance=transfer_impedance_jump_coefficients,
         omega=omega,
         wavenumber=wavenumber,
         field_cache=prepared.field_cache,
@@ -2598,9 +2839,12 @@ function _coupled_solution_from_parts(
         prescribed_bem_neumann
     )
 
-    pressure_jump = (
+    # Residual of the interface condition: plain continuity, or the transfer-impedance jump.
+    pressure_jump = subtract_interface_transfer_impedance_jump!(
         system.interface_operators.fem_trace * fem_pressure -
-        system.interface_operators.bem_trace * bem_pressure
+        system.interface_operators.bem_trace * bem_pressure,
+        system_interface_transfer_impedance(system),
+        interface_flux,
     )
     pressure_scale = max(
         norm(system.interface_operators.fem_trace * fem_pressure),
