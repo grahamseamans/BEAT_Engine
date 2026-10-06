@@ -8,8 +8,12 @@ project_hash = "06dc96933ac36bd47a27ce3a45c6d1e154037ae1"
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
 version = "1.11.0"
 
+[[deps.Base64]]
+uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+version = "1.11.0"
+
 [[deps.BeatEngineCpuBundle]]
-deps = ["JSON", "LinearAlgebra", "PrecompileTools", "Printf", "SparseArrays", "StaticArrays", "Statistics"]
+deps = ["Base64", "JSON", "LinearAlgebra", "PrecompileTools", "Printf", "SHA", "SparseArrays", "StaticArrays", "Statistics"]
 path = "../julia_engine/BeatEngineCpuBundle"
 uuid = "dbb44b52-9b63-42c8-872c-0d4697051c06"
 version = "0.1.0"

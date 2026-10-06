@@ -55,6 +55,10 @@ using .BeatEngineCore
 
 include(joinpath(ENGINE_DIR, "BeatEngineDriver.jl"))
 
+# The coupled (FEM-BEM system) worker, `CoupledWorker`, with its own precompile
+# workload; `julia_local/coupled_solver.jl` runs it.
+include(joinpath(@__DIR__, "..", "..", "BeatEngineCoupledWorker.jl"))
+
 #: Four triangles, one closed tetrahedron, every face tagged as the source.
 #: The workload below only needs a mesh that solves; nothing it compiles
 #: depends on the geometry.

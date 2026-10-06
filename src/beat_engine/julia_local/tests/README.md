@@ -25,6 +25,7 @@ from a copied engine tree outside the checkout, after the ordinary Julia suite.
 | Coupled FEM-BEM-LEM | Voltage-driven transducer solved using monolithic and condensed formulations | Existing FP64 relative tolerance 1e-9 on acoustic/electromechanical quantities |
 | Precision | FP32 versus FP64 coupled and condensed results | Existing relative tolerance 1e-4 on primary fields |
 | Interface transfer-impedance layer | Jump `p_F - p_B = Z_s v_n` at the nodes; monolithic versus condensed `:none`/`:pressure`, voltage-driven transducer included; phasor conjugation with a mass term; lossless-interior power balance; lumped Helmholtz resonator (cavity `V/(rho c^2)`, vent branch read from the `R = M = 0` run, layer added as `Z_s/S`) | Jump and formulations 1e-9 relative; power balance and `P_layer = R/2 ∫|v|^2` 1e-9; lumped vent flow 1 % and 0.5° at f <= 100 Hz; Helmholtz shift by a mass layer 2 %; FP32 1e-4 on flux and interior for R <= 10^6 rho c, on the exterior for R <= 10 rho c unless `:pressure` or refinement |
+| Coupled worker bundle | The CPU bundle's `CoupledWorker` (pkgimage with the precompile workload) versus `BeatEngineCoupledDriver.jl` included from source, reference fixture at FP64, X symmetry and none | Workload recorded as solved, no module state left in the image; every output array relative 1e-10 |
 
 The analytical exterior oracle is `p(x) = exp(i k r) / r`, for the solver's
 `exp(-i omega t)` convention. Its facet-normal derivative is

@@ -96,13 +96,11 @@ end
 end
 
 # The worker's request parser for interface transfer-impedance layers, end to end through
-# `solve_request`. The solver script is loaded up to its entry point (as memory_mesh_tests.jl
-# does) into its own module, so its copies of the engine modules never replace the ones the
-# rest of the suite uses.
+# `solve_request`. The coupled driver is included from source into its own module, so its
+# copies of the engine modules never replace the ones the rest of the suite uses.
 @testset "interface transfer_impedance on the wire" begin
-    solver_path = normpath(joinpath(@__DIR__, "..", "coupled_solver.jl"))
     solver = Core.eval(Main, :(module TransferImpedanceWireSolver end))
-    Base.include_string(solver, first(split(read(solver_path, String), "\nif \"--worker\" in ARGS")), solver_path)
+    Base.include(solver, normpath(joinpath(@__DIR__, "..", "BeatEngineCoupledDriver.jl")))
     fixtures = joinpath(@__DIR__, "fixtures")
     group(mesh_id, tag) = Dict{String,Any}("mesh_id" => mesh_id, "dimension" => 2, "tag" => tag, "name" => nothing)
     boundary(id, kind, region, mesh_id, tag) = Dict{String,Any}("id" => id, "name" => id, "kind" => kind,
